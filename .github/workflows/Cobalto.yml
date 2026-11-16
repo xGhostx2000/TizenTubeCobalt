@@ -1,0 +1,118 @@
+name: TizenTube Cobalt com logotipo YouTube (APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Arquitetura da TV (se nao instalar, tenta a outra)"
+        type: choice
+        options:
+          - arm
+          - arm64
+        default: arm
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descarregar o APK oficial (ultima release)
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          curl -fL --retry 3 -o original.apk "https://github.com/reisxd/TizenTubeCobalt/releases/latest/download/cobalt-${ARCH}.apk"
+          ls -la original.apk
+
+      - name: Trocar icone e banner pelo logotipo do YouTube
+        run: |
+          python3 -m venv venv
+          ./venv/bin/pip install pillow
+          ./venv/bin/python - original.apk patched.apk <<'PY'
+          import io, os, re, sys, zipfile
+          from PIL import Image, ImageDraw
+
+          SRC, DST = sys.argv[1], sys.argv[2]
+          RED = (255, 0, 0, 255)
+          SS = 8
+
+          def youtube_logo(width):
+              w = width * SS
+              h = round(w * 20 / 28.5714)
+              im = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+              d = ImageDraw.Draw(im)
+              d.rounded_rectangle([0, 0, w - 1, h - 1], radius=round(h * 0.29), fill=RED)
+              th = h * 0.50
+              tw = th * 0.87
+              cx, cy = w / 2 + tw * 0.04, h / 2
+              d.polygon([(cx - tw / 2, cy - th / 2), (cx - tw / 2, cy + th / 2), (cx + tw / 2, cy)],
+                        fill=(255, 255, 255, 255))
+              return im.resize((width, round(h / SS)), Image.LANCZOS)
+
+          def render(size, bg=None, fill=0.94):
+              W, H = size
+              canvas = Image.new('RGBA', size, bg if bg else (0, 0, 0, 0))
+              logo_w = int(min(W * fill, H * fill * 28.5714 / 20))
+              logo = youtube_logo(logo_w)
+              canvas.paste(logo, ((W - logo.width) // 2, (H - logo.height) // 2), logo)
+              return canvas
+
+          def to_png(im):
+              buf = io.BytesIO()
+              im.save(buf, 'PNG', optimize=True)
+              return buf.getvalue()
+
+          zin = zipfile.ZipFile(SRC)
+          zout = zipfile.ZipFile(DST, 'w')
+          replaced, dropped = [], []
+          for info in zin.infolist():
+              name = info.filename
+              # remove old signature files (the APK is re-signed afterwards)
+              if re.match(r'META-INF/[^/]+\.(SF|RSA|DSA|EC)$', name, re.I) or name == 'META-INF/MANIFEST.MF':
+                  dropped.append(name)
+                  continue
+              data = zin.read(name)
+              # launcher icon (res/mipmap-*/ic_app) and TV banner (res/drawable*/app_banner)
+              if re.match(r'res/mipmap-[a-z]+-v4/ic_app$', name) or re.match(r'res/drawable[^/]*/app_banner$', name):
+                  size = Image.open(io.BytesIO(data)).size
+                  if name.endswith('/app_banner'):
+                      data = to_png(render(size, bg=(52, 52, 52, 255), fill=0.50))
+                  else:
+                      data = to_png(render(size))
+                  replaced.append((name, size))
+              zi = zipfile.ZipInfo(name, info.date_time)
+              zi.external_attr = info.external_attr
+              zi.compress_type = info.compress_type
+              zi.create_system = info.create_system
+              zout.writestr(zi, data, compress_type=info.compress_type)
+          zout.close()
+          for n, s in replaced:
+              print('OK', n, s)
+          print('removidos:', dropped)
+          if len(replaced) != 10:
+              sys.exit('ERRO: esperava trocar 10 imagens, troquei %d' % len(replaced))
+          PY
+
+      - name: Alinhar e assinar
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$BT" ] || [ ! -x "$BT/apksigner" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;35.0.0" >/dev/null || true
+            BT="$ANDROID_HOME/build-tools/35.0.0"
+          fi
+          echo "build-tools: $BT"
+          "$BT/zipalign" -P 16 -f 4 patched.apk aligned.apk || "$BT/zipalign" -p -f 4 patched.apk aligned.apk
+          keytool -genkeypair -keystore ks.jks -storepass android -keypass android -alias key \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TizenTube local"
+          "$BT/apksigner" sign --ks ks.jks --ks-pass pass:android --key-pass pass:android \
+            --out "TizenTubeCobalt-YouTube-${ARCH}.apk" aligned.apk
+          "$BT/apksigner" verify -v "TizenTubeCobalt-YouTube-${ARCH}.apk"
+          ls -la *.apk
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TizenTubeCobalt-YouTube-${{ inputs.arch }}
+          path: TizenTubeCobalt-YouTube-*.apk
+          compression-level: 0
+          if-no-files-found: error
